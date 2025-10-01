@@ -7,17 +7,30 @@
 #define I2S_SD      22
 #define I2S_SCK     26
 #define I2S_PORT    I2S_NUM_0
+#define trigger 23  //hcsr trigger
+#define echo 21  //hcsr trigger
 
 #define SAMPLE_RATE 16000
 #define CHUNK_SIZE  1024    // Bloque pequeño
 
-const char* ssid = "INFINITUMFB33";
-const char* password = "HdKHhdnK7C";
-const char* serverUrl = "http://192.168.1.79:8000/upload_chunk";
-const char* serverFinalizar = "http://192.168.1.79:8000/finalize_wav";
+const char* ssid = "Holiwis";
+const char* password = "12345678";
+const char* serverUrl = "http://192.168.137.187:8000/upload_chunk";
+const char* serverFinalizar = "http://192.168.137.187:8000/finalize_wav";
 
 int32_t buffer[CHUNK_SIZE];
-int cont = 0;
+
+float readDistance() {
+  digitalWrite(trigger, LOW);   // Set trig pin to low to ensure a clean pulse
+  delayMicroseconds(2);         // Delay for 2 microseconds
+  digitalWrite(trigger, HIGH);  // Send a 10 microsecond pulse by setting trig pin to high
+  delayMicroseconds(10);
+  digitalWrite(trigger, LOW);  // Set trig pin back to low
+
+  // Measure the pulse width of the echo pin and calculate the distance value
+  float distance = pulseIn(echo, HIGH) / 58.00;  // Formula: (340m/s * 1us) / 2
+  return distance;
+}
 
 void setupI2S() {
   i2s_config_t i2s_config = {
@@ -84,26 +97,28 @@ void setup() {
   Serial.println("\nWiFi conectado");
 
   setupI2S();
+  pinMode(trigger, OUTPUT);
+  pinMode(echo, INPUT);
 }
 
 void loop() {
+  float distance = readDistance();
   size_t bytesRead;
-  // Leer un chunk
-  i2s_read(I2S_PORT, buffer, CHUNK_SIZE * sizeof(int32_t), &bytesRead, portMAX_DELAY);
 
-  // Convertir a 16 bits PCM
-  int16_t pcmChunk[CHUNK_SIZE];
-  for (int i = 0; i < CHUNK_SIZE; i++) {
-    pcmChunk[i] = buffer[i] >> 16;
-  }
-
-  // Enviar chunk al servidor
-  sendChunkToServer(pcmChunk, CHUNK_SIZE * sizeof(int16_t));
-
-  delay(10); // opcional, para no saturar la red
-  cont ++;
-  Serial.println(cont);
-  if (cont==30){
+  if (distance<60){
+    // Leer un chunk
+    i2s_read(I2S_PORT, buffer, CHUNK_SIZE * sizeof(int32_t), &bytesRead, portMAX_DELAY);
+    // Convertir a 16 bits PCM
+    int16_t pcmChunk[CHUNK_SIZE];
+    for (int i = 0; i < CHUNK_SIZE; i++) {
+      pcmChunk[i] = buffer[i] >> 16;
+    }
+    // Enviar chunk al servidor
+    sendChunkToServer(pcmChunk, CHUNK_SIZE * sizeof(int16_t));
+    delay(10); // opcional, para no saturar la red
+    cont ++;
+    Serial.println(cont);
+  }else{
     finalizeWav();
   }
 

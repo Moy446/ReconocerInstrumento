@@ -1,12 +1,28 @@
 #include <Arduino.h>
 #include <driver/i2s.h>
 
-#define I2S_WS      25   // LRCL
-#define I2S_SD      22   // DOUT
-#define I2S_SCK     26   // BCLK
+#define I2S_WS 25   // LRCL
+#define I2S_SD 22   // DOUT
+#define I2S_SCK 26   // BCLK
+#define trigger 23  //hcsr trigger
+#define echo 21  //hcsr trigger
 
 #define SAMPLE_RATE     44100
 #define I2S_PORT        I2S_NUM_0
+
+
+float readDistance() {
+  digitalWrite(trigger, LOW);   // Set trig pin to low to ensure a clean pulse
+  delayMicroseconds(2);         // Delay for 2 microseconds
+  digitalWrite(trigger, HIGH);  // Send a 10 microsecond pulse by setting trig pin to high
+  delayMicroseconds(10);
+  digitalWrite(trigger, LOW);  // Set trig pin back to low
+
+  // Measure the pulse width of the echo pin and calculate the distance value
+  float distance = pulseIn(echo, HIGH) / 58.00;  // Formula: (340m/s * 1us) / 2
+  return distance;
+}
+
 
 void setup() {
   Serial.begin(115200);
@@ -37,15 +53,21 @@ void setup() {
   i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
   i2s_set_pin(I2S_PORT, &pin_config);
 
+  pinMode(trigger, OUTPUT);
+  pinMode(echo, INPUT);
+
   Serial.println("INMP441 listo para grabar audio.");
+  Serial.println("HC-SR04 listo para medir distancia");
 }
 
 void loop() {
   const int bufferSize = 1024;
   int32_t buffer[bufferSize];
   size_t bytesRead;
+  float distancia = readDistance();
 
-  // Leer datos crudos desde el micrófono
+  if(distancia<60){
+    // Leer datos crudos desde el micrófono
   i2s_read(I2S_PORT, (void*)buffer, bufferSize * sizeof(int32_t), &bytesRead, portMAX_DELAY);
 
   // Número real de muestras leídas
@@ -77,4 +99,9 @@ void loop() {
   Serial.println(peak);
 
   delay(100);
+  }
+  else{
+    Serial.println("Acercate mas");
+  }
+  delay(400);
 }
