@@ -2,32 +2,40 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <driver/i2s.h>
+#include "DHT.h"
 
 #define I2S_WS      25
 #define I2S_SD      22
 #define I2S_SCK     26
 #define I2S_PORT    I2S_NUM_0
-#define trigger 23  //hcsr trigger
-#define echo 21  //hcsr trigger
+#define trigger     23  //hcsr trigger
+#define echo        21  //hcsr trigger
+#define DHTPIN 4        // Pin de datos
+#define DHTTYPE DHT11   // Tipo de sensor
 
 #define SAMPLE_RATE 16000
 #define CHUNK_SIZE  1024    // Bloque pequeño
 
+/*Casa
+INFINITUMFB33
+HdKHhdnK7C*/
 const char* ssid = "Holiwis";
-const char* password = "12345678";
-const char* serverUrl = "http://192.168.137.187:8000/upload_chunk";
-const char* serverFinalizar = "http://192.168.137.187:8000/finalize_wav";
+const char* password = "1234567890";
+const char* serverUrl = "http://192.168.1.84:8000/upload_chunk";
+const char* serverFinalizar = "http://192.168.1.84:8000/finalize_wav";
+DHT dht(DHTPIN, DHTTYPE);
+
+
 
 int32_t buffer[CHUNK_SIZE];
 
 float readDistance() {
   digitalWrite(trigger, LOW);   // Set trig pin to low to ensure a clean pulse
-  delayMicroseconds(2);         // Delay for 2 microseconds
+  delayMicroseconds(2);         
   digitalWrite(trigger, HIGH);  // Send a 10 microsecond pulse by setting trig pin to high
   delayMicroseconds(10);
   digitalWrite(trigger, LOW);  // Set trig pin back to low
 
-  // Measure the pulse width of the echo pin and calculate the distance value
   float distance = pulseIn(echo, HIGH) / 58.00;  // Formula: (340m/s * 1us) / 2
   return distance;
 }
@@ -99,11 +107,16 @@ void setup() {
   setupI2S();
   pinMode(trigger, OUTPUT);
   pinMode(echo, INPUT);
+  dht.begin();
 }
 
 void loop() {
   float distance = readDistance();
+  float humedad = dht.readHumidity();
   size_t bytesRead;
+  if (isnan(humedad)){
+    Serial.println("Error al leer el sensor DHT11");
+  }
 
   if (distance<60){
     // Leer un chunk
@@ -111,13 +124,15 @@ void loop() {
     // Convertir a 16 bits PCM
     int16_t pcmChunk[CHUNK_SIZE];
     for (int i = 0; i < CHUNK_SIZE; i++) {
-      pcmChunk[i] = buffer[i] >> 16;
+      int32_t sample = buffer[i];
+      sample = (sample >> 8) & 0xFFFFFF; // tomar 24 bits útiles
+      pcmChunk[i] = sample >> 8; 
     }
     // Enviar chunk al servidor
     sendChunkToServer(pcmChunk, CHUNK_SIZE * sizeof(int16_t));
     delay(10); // opcional, para no saturar la red
-    cont ++;
-    Serial.println(cont);
+    Serial.print("Humedad: ");
+    Serial.print(humedad);
   }else{
     finalizeWav();
   }
