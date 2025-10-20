@@ -15,19 +15,26 @@
 
 #define SAMPLE_RATE 16000
 #define CHUNK_SIZE  1024    // Bloque pequeño
+#define RECORD_TIME 5000    // Tiempo de grabación en ms
 
 /*Casa
 INFINITUMFB33
-HdKHhdnK7C*/
-const char* ssid = "Holiwis";
-const char* password = "1234567890";
-const char* serverUrl = "http://192.168.1.84:8000/upload_chunk";
-const char* serverFinalizar = "http://192.168.1.84:8000/finalize_wav";
+HdKHhdnK7C
+Escuela
+saquenmedeaqui
+12345678*/
+
+const char* ssid = "ANA5000";
+const char* password = "123456789";
+const char* serverUrl = "http://192.168.137.225:8000/upload_chunk";
+const char* serverFinalizar = "http://192.168.137.225:8000/finalize_wav";
 DHT dht(DHTPIN, DHTTYPE);
 
 
 
-int32_t buffer[CHUNK_SIZE];
+int16_t buffer[CHUNK_SIZE];  // Cambiar a 16 bits directamente
+bool isRecording = false;
+unsigned long recordStartTime = 0;
 
 float readDistance() {
   digitalWrite(trigger, LOW);   // Set trig pin to low to ensure a clean pulse
@@ -44,13 +51,13 @@ void setupI2S() {
   i2s_config_t i2s_config = {
     .mode = i2s_mode_t(I2S_MODE_MASTER | I2S_MODE_RX),
     .sample_rate = SAMPLE_RATE,
-    .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
-    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
-    .communication_format = i2s_comm_format_t(I2S_COMM_FORMAT_I2S | I2S_COMM_FORMAT_I2S_MSB),
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,  // Cambiar a 16 bits para mejor compatibilidad
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,   // Solo canal izquierdo para INMP441
+    .communication_format = I2S_COMM_FORMAT_STAND_I2S,  // Formato estándar I2S
     .intr_alloc_flags = 0,
-    .dma_buf_count = 4,
-    .dma_buf_len = 1024,
-    .use_apll = false,
+    .dma_buf_count = 8,  // Incrementar buffers para evitar pérdida de datos
+    .dma_buf_len = 512,  // Reducir tamaño de buffer individual
+    .use_apll = true,    // Usar APLL para mejor precisión de frecuencia
     .tx_desc_auto_clear = false,
     .fixed_mclk = 0
   };
@@ -66,20 +73,23 @@ void setupI2S() {
   i2s_set_pin(I2S_PORT, &pin_config);
 }
 
-void sendChunkToServer(int16_t* pcmChunk, size_t size) {
+void sendChunkToServer(int16_t* pcmChunk, size_t size, float humedad) {
   HTTPClient http;
   http.begin(serverUrl);
   http.addHeader("Content-Type", "application/octet-stream");
+  http.addHeader("X-Humidity", String(humedad));  // Enviar humedad en header
+  http.addHeader("X-Timestamp", String(millis())); // Timestamp para sincronización
 
   int httpResponseCode = http.POST((uint8_t*)pcmChunk, size);
 
   if (httpResponseCode > 0) {
-    Serial.printf("Chunk enviado, servidor respondió: %d\n", httpResponseCode);
+    Serial.printf("Chunk enviado con humedad %.1f%%, servidor respondió: %d\n", humedad, httpResponseCode);
   } else {
     Serial.printf("Error enviando chunk: %s\n", http.errorToString(httpResponseCode).c_str());
   }
   http.end();
 }
+
 void finalizeWav() {
   HTTPClient http;
   http.begin(serverFinalizar);
@@ -113,29 +123,55 @@ void setup() {
 void loop() {
   float distance = readDistance();
   float humedad = dht.readHumidity();
-  size_t bytesRead;
-  if (isnan(humedad)){
+  
+  if (isnan(humedad)) {
     Serial.println("Error al leer el sensor DHT11");
+    humedad = 0.0; // Valor por defecto si hay error
   }
 
-  if (distance<60){
-    // Leer un chunk
-    i2s_read(I2S_PORT, buffer, CHUNK_SIZE * sizeof(int32_t), &bytesRead, portMAX_DELAY);
-    // Convertir a 16 bits PCM
-    int16_t pcmChunk[CHUNK_SIZE];
-    for (int i = 0; i < CHUNK_SIZE; i++) {
-      int32_t sample = buffer[i];
-      sample = (sample >> 8) & 0xFFFFFF; // tomar 24 bits útiles
-      pcmChunk[i] = sample >> 8; 
+  // Lógica mejorada para inicio/fin de grabación
+  if (distance < 60 && !isRecording) {
+    // Comenzar grabación
+    isRecording = true;
+    recordStartTime = millis();
+    Serial.printf("Iniciando grabación. Distancia: %.1fcm, Humedad: %.1f%%\n", distance, humedad);
+  }
+
+  if (isRecording) {
+    // Verificar si debe continuar grabando
+    if (distance >= 60 || (millis() - recordStartTime) > RECORD_TIME) {
+      // Finalizar grabación
+      isRecording = false;
+      finalizeWav();
+      Serial.println("Finalizando grabación");
+      delay(2000); // Pausa antes de permitir nueva grabación
+      return;
     }
-    // Enviar chunk al servidor
-    sendChunkToServer(pcmChunk, CHUNK_SIZE * sizeof(int16_t));
-    delay(10); // opcional, para no saturar la red
-    Serial.print("Humedad: ");
-    Serial.print(humedad);
-  }else{
-    finalizeWav();
-  }
 
+    // Leer datos de audio directamente en 16 bits
+    size_t bytesRead;
+    esp_err_t result = i2s_read(I2S_PORT, buffer, CHUNK_SIZE * sizeof(int16_t), &bytesRead, 100);
+    
+    if (result == ESP_OK && bytesRead > 0) {
+      // Los datos ya están en formato 16 bits, no necesitan conversión adicional
+      size_t samplesRead = bytesRead / sizeof(int16_t);
+      
+      // Aplicar ganancia para mejorar el volumen
+      for (int i = 0; i < samplesRead; i++) {
+        int32_t sample = buffer[i] * 4; // Aumentar ganancia
+        if (sample > 32767) sample = 32767;
+        if (sample < -32768) sample = -32768;
+        buffer[i] = (int16_t)sample;
+      }
+      
+      // Enviar chunk al servidor con datos del sensor
+      sendChunkToServer(buffer, bytesRead, humedad);
+      
+      Serial.printf("Chunk enviado - Muestras: %d, Humedad: %.1f%%, Distancia: %.1fcm\n", 
+                   samplesRead, humedad, distance);
+    }
+  }
+  
+  delay(10); // Pequeña pausa para no saturar el sistema
 }
 
