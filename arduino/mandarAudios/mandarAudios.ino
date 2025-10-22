@@ -10,7 +10,7 @@
 #define I2S_PORT    I2S_NUM_0
 #define trigger     23  //hcsr trigger
 #define echo        21  //hcsr trigger
-#define DHTPIN 4        // Pin de datos
+#define DHTPIN      4   // Pin de datos
 #define DHTTYPE DHT11   // Tipo de sensor
 
 #define SAMPLE_RATE 16000
@@ -19,20 +19,17 @@
 
 /*Casa
 INFINITUMFB33
-HdKHhdnK7C
-Escuela
-saquenmedeaqui
-12345678*/
-
-const char* ssid = "ANA5000";
-const char* password = "123456789";
-const char* serverUrl = "http://192.168.137.225:8000/upload_chunk";
-const char* serverFinalizar = "http://192.168.137.225:8000/finalize_wav";
+HdKHhdnK7C*/
+const char* ssid = "Holiwis";
+const char* password = "1234567890";
+const char* serverUrl = "http://192.168.1.84:8000/upload_chunk";
+const char* serverFinalizar = "http://192.168.1.84:8000/finalize_wav";
 DHT dht(DHTPIN, DHTTYPE);
 
 
 
-int16_t buffer[CHUNK_SIZE];  // Cambiar a 16 bits directamente
+int32_t buffer[CHUNK_SIZE];  // Buffer en 32 bits para INMP441
+int16_t samples[CHUNK_SIZE]; // Buffer para muestras convertidas a 16 bits
 bool isRecording = false;
 unsigned long recordStartTime = 0;
 
@@ -51,13 +48,13 @@ void setupI2S() {
   i2s_config_t i2s_config = {
     .mode = i2s_mode_t(I2S_MODE_MASTER | I2S_MODE_RX),
     .sample_rate = SAMPLE_RATE,
-    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,  // Cambiar a 16 bits para mejor compatibilidad
-    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,   // Solo canal izquierdo para INMP441
-    .communication_format = I2S_COMM_FORMAT_STAND_I2S,  // Formato estándar I2S
-    .intr_alloc_flags = 0,
-    .dma_buf_count = 8,  // Incrementar buffers para evitar pérdida de datos
-    .dma_buf_len = 512,  // Reducir tamaño de buffer individual
-    .use_apll = true,    // Usar APLL para mejor precisión de frecuencia
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,  // INMP441 usa 32 bits
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,   // Solo canal izquierdo
+    .communication_format = i2s_comm_format_t(I2S_COMM_FORMAT_I2S | I2S_COMM_FORMAT_I2S_MSB),
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count = 4,
+    .dma_buf_len = 1024,
+    .use_apll = false,
     .tx_desc_auto_clear = false,
     .fixed_mclk = 0
   };
@@ -89,7 +86,6 @@ void sendChunkToServer(int16_t* pcmChunk, size_t size, float humedad) {
   }
   http.end();
 }
-
 void finalizeWav() {
   HTTPClient http;
   http.begin(serverFinalizar);
@@ -148,24 +144,32 @@ void loop() {
       return;
     }
 
-    // Leer datos de audio directamente en 16 bits
-    size_t bytesRead;
-    esp_err_t result = i2s_read(I2S_PORT, buffer, CHUNK_SIZE * sizeof(int16_t), &bytesRead, 100);
+    // Leer datos de audio en 32 bits (formato INMP441)
+    size_t bytesRead = 0;
+    esp_err_t result = i2s_read(I2S_PORT, buffer, CHUNK_SIZE * sizeof(int32_t), &bytesRead, portMAX_DELAY);
     
     if (result == ESP_OK && bytesRead > 0) {
-      // Los datos ya están en formato 16 bits, no necesitan conversión adicional
-      size_t samplesRead = bytesRead / sizeof(int16_t);
+      size_t samplesRead = bytesRead / sizeof(int32_t);
       
-      // Aplicar ganancia para mejorar el volumen
+      // Convertir de 32 bits a 16 bits correctamente para INMP441
       for (int i = 0; i < samplesRead; i++) {
-        int32_t sample = buffer[i] * 4; // Aumentar ganancia
-        if (sample > 32767) sample = 32767;
-        if (sample < -32768) sample = -32768;
-        buffer[i] = (int16_t)sample;
+        // INMP441 entrega datos en los bits 31-14 (18 bits significativos)
+        // Desplazar 14 bits a la derecha para obtener los 18 bits útiles
+        // Luego desplazar 2 bits más para convertir a 16 bits
+        int32_t sample32 = buffer[i] >> 14;  // Obtener bits significativos
+        
+        // Aplicar ganancia (ajustar según necesidad, probar valores entre 1-8)
+        sample32 = sample32 * 2;
+        
+        // Limitar a rango de 16 bits con signo
+        if (sample32 > 32767) sample32 = 32767;
+        if (sample32 < -32768) sample32 = -32768;
+        
+        samples[i] = (int16_t)sample32;
       }
       
       // Enviar chunk al servidor con datos del sensor
-      sendChunkToServer(buffer, bytesRead, humedad);
+      sendChunkToServer(samples, samplesRead * sizeof(int16_t), humedad);
       
       Serial.printf("Chunk enviado - Muestras: %d, Humedad: %.1f%%, Distancia: %.1fcm\n", 
                    samplesRead, humedad, distance);
