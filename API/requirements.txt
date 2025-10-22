@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+librosa
+scikit-learn
+numpy
+joblib
+soundfile
+azure-storage-blob>=12.20.0

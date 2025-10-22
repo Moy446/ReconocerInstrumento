@@ -2,34 +2,56 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <driver/i2s.h>
+#include "DHT.h"
 
-#define I2S_WS      25   // LRCL
-#define I2S_SD      22   // DOUT
-#define I2S_SCK     26   // BCLK
+#define I2S_WS      25
+#define I2S_SD      22
+#define I2S_SCK     26
 #define I2S_PORT    I2S_NUM_0
+#define trigger     23  //hcsr trigger
+#define echo        21  //hcsr trigger
+#define DHTPIN      4   // Pin de datos
+#define DHTTYPE DHT11   // Tipo de sensor
 
-#define SAMPLE_RATE     8000
-#define RECORD_TIME     2              // segundos
-#define BUFFER_SIZE     (SAMPLE_RATE * RECORD_TIME)
+#define SAMPLE_RATE 16000
+#define CHUNK_SIZE  1024    // Bloque pequeño
+#define RECORD_TIME 5000    // Tiempo de grabación en ms
 
-const char* ssid = "INFINITUMFB33";
-const char* password = "HdKHhdnK7C";
-const char* serverUrl = "http://192.168.1.78:8000/upload"; // endpoint en tu servidor
+/*Casa
+INFINITUMFB33
+HdKHhdnK7C*/
+const char* ssid = "Holiwis";
+const char* password = "1234567890";
+const char* serverUrl = "http://192.168.1.84:8000/upload_chunk";
+const char* serverFinalizar = "http://192.168.1.84:8000/finalize_wav";
+DHT dht(DHTPIN, DHTTYPE);
 
-// Buffer para guardar audio
-int32_t samples[BUFFER_SIZE];
 
-// ----------------------
-// Configuración I2S
-// ----------------------
+
+int32_t buffer[CHUNK_SIZE];  // Buffer en 32 bits para INMP441
+int16_t samples[CHUNK_SIZE]; // Buffer para muestras convertidas a 16 bits
+bool isRecording = false;
+unsigned long recordStartTime = 0;
+
+float readDistance() {
+  digitalWrite(trigger, LOW);   // Set trig pin to low to ensure a clean pulse
+  delayMicroseconds(2);         
+  digitalWrite(trigger, HIGH);  // Send a 10 microsecond pulse by setting trig pin to high
+  delayMicroseconds(10);
+  digitalWrite(trigger, LOW);  // Set trig pin back to low
+
+  float distance = pulseIn(echo, HIGH) / 58.00;  // Formula: (340m/s * 1us) / 2
+  return distance;
+}
+
 void setupI2S() {
   i2s_config_t i2s_config = {
     .mode = i2s_mode_t(I2S_MODE_MASTER | I2S_MODE_RX),
     .sample_rate = SAMPLE_RATE,
-    .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
-    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT, // L/R=GND → canal izquierdo
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,  // INMP441 usa 32 bits
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,   // Solo canal izquierdo
     .communication_format = i2s_comm_format_t(I2S_COMM_FORMAT_I2S | I2S_COMM_FORMAT_I2S_MSB),
-    .intr_alloc_flags = 0,
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
     .dma_buf_count = 4,
     .dma_buf_len = 1024,
     .use_apll = false,
@@ -48,103 +70,112 @@ void setupI2S() {
   i2s_set_pin(I2S_PORT, &pin_config);
 }
 
-// ----------------------
-// Generar encabezado WAV
-// ----------------------
-void createWavHeader(uint8_t* header, int wavSize, int sampleRate) {
-  int byteRate = sampleRate * 2; // 16 bits = 2 bytes
-
-  memcpy(header, "RIFF", 4);
-  *(int32_t*)(header + 4) = wavSize - 8;
-  memcpy(header + 8, "WAVE", 4);
-
-  memcpy(header + 12, "fmt ", 4);
-  *(int32_t*)(header + 16) = 16;          // Subchunk1Size
-  *(int16_t*)(header + 20) = 1;           // AudioFormat PCM
-  *(int16_t*)(header + 22) = 1;           // NumChannels = 1 (mono)
-  *(int32_t*)(header + 24) = sampleRate;  // SampleRate
-  *(int32_t*)(header + 28) = byteRate;    // ByteRate
-  *(int16_t*)(header + 32) = 2;           // BlockAlign
-  *(int16_t*)(header + 34) = 16;          // BitsPerSample
-
-  memcpy(header + 36, "data", 4);
-  *(int32_t*)(header + 40) = wavSize - 44;
-}
-
-// ----------------------
-// Grabar audio en buffer
-// ----------------------
-void recordAudio() {
-  size_t bytesRead;
-  int totalSamples = 0;
-
-  Serial.println("Grabando...");
-
-  while (totalSamples < BUFFER_SIZE) {
-    i2s_read(I2S_PORT, (void*)&samples[totalSamples],
-             (BUFFER_SIZE - totalSamples) * sizeof(int32_t),
-             &bytesRead, portMAX_DELAY);
-
-    totalSamples += bytesRead / sizeof(int32_t);
-  }
-
-  Serial.println("Grabación finalizada");
-}
-
-// ----------------------
-// Enviar WAV al servidor
-// ----------------------
-void sendAudio() {
-  int16_t pcm[BUFFER_SIZE];
-  for (int i = 0; i < BUFFER_SIZE; i++) {
-    pcm[i] = samples[i] >> 16; // convertir 32 bits → 16 bits PCM
-  }
-
-  int wavSize = 44 + BUFFER_SIZE * sizeof(int16_t);
-  uint8_t* wavData = (uint8_t*)malloc(wavSize);
-
-  createWavHeader(wavData, wavSize, SAMPLE_RATE);
-  memcpy(wavData + 44, pcm, BUFFER_SIZE * sizeof(int16_t));
-
+void sendChunkToServer(int16_t* pcmChunk, size_t size, float humedad) {
   HTTPClient http;
   http.begin(serverUrl);
-  http.addHeader("Content-Type", "audio/wav");
+  http.addHeader("Content-Type", "application/octet-stream");
+  http.addHeader("X-Humidity", String(humedad));  // Enviar humedad en header
+  http.addHeader("X-Timestamp", String(millis())); // Timestamp para sincronización
 
-  int httpResponseCode = http.POST(wavData, wavSize);
+  int httpResponseCode = http.POST((uint8_t*)pcmChunk, size);
 
   if (httpResponseCode > 0) {
-    Serial.printf("Respuesta del servidor: %d\n", httpResponseCode);
+    Serial.printf("Chunk enviado con humedad %.1f%%, servidor respondió: %d\n", humedad, httpResponseCode);
   } else {
-    Serial.printf("Error en envío: %s\n", http.errorToString(httpResponseCode).c_str());
+    Serial.printf("Error enviando chunk: %s\n", http.errorToString(httpResponseCode).c_str());
   }
-
   http.end();
-  free(wavData);
 }
-
-// ----------------------
-// Setup principal
-// ----------------------
+void finalizeWav() {
+  HTTPClient http;
+  http.begin(serverFinalizar);
+  int httpResponseCode = http.GET();
+  if (httpResponseCode > 0) {
+    String response = http.getString();
+    Serial.println("Respuesta del servidor:");
+    Serial.println(response);
+  } else {
+    Serial.println("Error en GET");
+  }
+  http.end();
+}
 void setup() {
   Serial.begin(115200);
   WiFi.begin(ssid, password);
-  Serial.println("Conectando WiFi...");
 
+  Serial.println("Conectando WiFi...");
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
   }
-
   Serial.println("\nWiFi conectado");
 
   setupI2S();
+  pinMode(trigger, OUTPUT);
+  pinMode(echo, INPUT);
+  dht.begin();
 }
 
-// ----------------------
-// Loop principal
-// ----------------------
 void loop() {
-  recordAudio();
-  sendAudio();
-  delay(10000); // espera 10s entre grabaciones
+  float distance = readDistance();
+  float humedad = dht.readHumidity();
+  
+  if (isnan(humedad)) {
+    Serial.println("Error al leer el sensor DHT11");
+    humedad = 0.0; // Valor por defecto si hay error
+  }
+
+  // Lógica mejorada para inicio/fin de grabación
+  if (distance < 60 && !isRecording) {
+    // Comenzar grabación
+    isRecording = true;
+    recordStartTime = millis();
+    Serial.printf("Iniciando grabación. Distancia: %.1fcm, Humedad: %.1f%%\n", distance, humedad);
+  }
+
+  if (isRecording) {
+    // Verificar si debe continuar grabando
+    if (distance >= 60 || (millis() - recordStartTime) > RECORD_TIME) {
+      // Finalizar grabación
+      isRecording = false;
+      finalizeWav();
+      Serial.println("Finalizando grabación");
+      delay(2000); // Pausa antes de permitir nueva grabación
+      return;
+    }
+
+    // Leer datos de audio en 32 bits (formato INMP441)
+    size_t bytesRead = 0;
+    esp_err_t result = i2s_read(I2S_PORT, buffer, CHUNK_SIZE * sizeof(int32_t), &bytesRead, portMAX_DELAY);
+    
+    if (result == ESP_OK && bytesRead > 0) {
+      size_t samplesRead = bytesRead / sizeof(int32_t);
+      
+      // Convertir de 32 bits a 16 bits correctamente para INMP441
+      for (int i = 0; i < samplesRead; i++) {
+        // INMP441 entrega datos en los bits 31-14 (18 bits significativos)
+        // Desplazar 14 bits a la derecha para obtener los 18 bits útiles
+        // Luego desplazar 2 bits más para convertir a 16 bits
+        int32_t sample32 = buffer[i] >> 14;  // Obtener bits significativos
+        
+        // Aplicar ganancia (ajustar según necesidad, probar valores entre 1-8)
+        sample32 = sample32 * 2;
+        
+        // Limitar a rango de 16 bits con signo
+        if (sample32 > 32767) sample32 = 32767;
+        if (sample32 < -32768) sample32 = -32768;
+        
+        samples[i] = (int16_t)sample32;
+      }
+      
+      // Enviar chunk al servidor con datos del sensor
+      sendChunkToServer(samples, samplesRead * sizeof(int16_t), humedad);
+      
+      Serial.printf("Chunk enviado - Muestras: %d, Humedad: %.1f%%, Distancia: %.1fcm\n", 
+                   samplesRead, humedad, distance);
+    }
+  }
+  
+  delay(10); // Pequeña pausa para no saturar el sistema
 }
+
