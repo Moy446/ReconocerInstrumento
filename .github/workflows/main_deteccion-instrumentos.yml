@@ -58,10 +58,11 @@ jobs:
         uses: azure/webapps-deploy@v3
         id: deploy-to-webapp
         with:
-          app-name: 'deteccion-instrumentos'
+          app-name: 'deteccionInstrumentos'
           slot-name: 'Production'
 
           publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_FA286219F166406A81076C20D6647D21 }}
+
 
 
 
