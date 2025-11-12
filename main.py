@@ -5,6 +5,22 @@ import os
 import json
 from datetime import datetime
 from typing import Optional
+import sys
+
+# Cargar variables .env en desarrollo local si existe (no afecta Azure App Service que ya inyecta vars)
+try:
+    from dotenv import load_dotenv  # type: ignore
+    load_dotenv()
+except Exception:
+    pass
+
+# ML predictor (cargado si los archivos de modelo existen)
+PREDICTOR_AVAILABLE = False
+try:
+    from model.predict_runtime import AudioPredictor
+    PREDICTOR_AVAILABLE = True
+except Exception as _e:
+    PREDICTOR_AVAILABLE = False
 
 # Azure Blob (opcional)
 AZURE_AVAILABLE = False
@@ -49,6 +65,77 @@ if AZURE_AVAILABLE:
             print(f"No se pudo inicializar Azure Blob: {e}")
             blob_service = None
             container_client = None
+
+# Predictor global (opcional)
+predictor: Optional["AudioPredictor"] = None
+if PREDICTOR_AVAILABLE:
+    try:
+        predictor = AudioPredictor()
+        print("Predictor de audio cargado")
+    except Exception as e:
+        predictor = None
+        print(f"No se pudo cargar el predictor: {e}")
+
+# PostgreSQL (opcional) - proteger credenciales vía variables de entorno
+DB_AVAILABLE = False
+DB_DSN: Optional[str] = None
+
+# Opción 1: cadena de conexión completa (recomendada)
+DB_DSN = os.getenv("DATABASE_URL") or os.getenv("AZURE_POSTGRESQL_CONNECTION_STRING")
+if DB_DSN and DB_DSN.startswith("postgres://"):
+    # Normalizar prefijo para psycopg2
+    DB_DSN = DB_DSN.replace("postgres://", "postgresql://", 1)
+
+# Opción 2: componentes sueltos
+if not DB_DSN:
+    host = os.getenv("PGHOST")
+    db = os.getenv("PGDATABASE")
+    user = os.getenv("PGUSER")
+    pwd = os.getenv("PGPASSWORD")
+    port = os.getenv("PGPORT", "5432")
+    if host and db and user and pwd:
+        DB_DSN = f"postgresql://{user}:{pwd}@{host}:{port}/{db}"
+
+if DB_DSN:
+    DB_AVAILABLE = True
+
+pg_conn = None
+if DB_AVAILABLE:
+    try:
+        import psycopg2  # type: ignore
+        from psycopg2.extras import execute_values  # type: ignore
+        print("psycopg2 disponible; inserciones a PostgreSQL habilitadas si la conexión funciona")
+    except Exception as e:
+        DB_AVAILABLE = False
+        print(f"psycopg2 no disponible: {e}")
+
+TABLE_SQL = (
+    """
+    CREATE TABLE IF NOT EXISTS public.detections (
+        id SERIAL PRIMARY KEY,
+        instrument TEXT,
+        note TEXT,
+        humidity_avg DOUBLE PRECISION
+    );
+    """
+)
+
+def db_connect():
+    global pg_conn
+    if not DB_AVAILABLE or not DB_DSN:
+        return None
+    try:
+        import psycopg2  # type: ignore
+        if pg_conn is None or pg_conn.closed != 0:
+            # SSL requerido generalmente en Azure
+            pg_conn = psycopg2.connect(DB_DSN, sslmode=os.getenv("PGSSLMODE", "require"))
+            with pg_conn.cursor() as cur:
+                cur.execute(TABLE_SQL)
+                pg_conn.commit()
+        return pg_conn
+    except Exception as e:
+        print(f"No se pudo conectar a PostgreSQL: {e}")
+        return None
 
 @app.post("/upload_chunk")
 async def upload_chunk(request: Request):
@@ -152,6 +239,40 @@ def finalize_wav():
         except Exception as e:
             azure_info = {"error": str(e)}
 
+    # Predicción (si hay modelo)
+    prediction = {"instrument": "Unknown", "note": "Unknown"}
+    if predictor is not None:
+        try:
+            prediction = predictor.predict(wav_file)
+        except Exception as e:
+            prediction = {"instrument": "Unknown", "note": "Unknown", "error": str(e)}
+
+    # Insertar en PostgreSQL (si está configurado)
+    db_insert_status = None
+    if DB_AVAILABLE:
+        conn = db_connect()
+        if conn is not None:
+            try:
+                wav_url = None
+                if isinstance(azure_info, dict) and azure_info.get("wav_url"):
+                    wav_url = azure_info["wav_url"]
+                hum_avg = None
+                if isinstance(sensor_stats, dict) and "humidity_avg" in sensor_stats:
+                    hum_avg = float(sensor_stats["humidity_avg"]) if sensor_stats["humidity_avg"] is not None else None
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO public.detections (instrument, note, humidity_avg) VALUES (%s, %s, %s);",
+                        (
+                            prediction.get("instrument"),
+                            prediction.get("note"),
+                            hum_avg,
+                        ),
+                    )
+                    conn.commit()
+                db_insert_status = "inserted"
+            except Exception as e:
+                db_insert_status = f"error: {e}"
+
     # Limpiar datos para próxima grabación
     sensor_readings = []
 
@@ -161,9 +282,12 @@ def finalize_wav():
         "audio_size": filesize,
         "sensor_data_file": sensor_data_file,
         "sensor_stats": sensor_stats,
+        "prediction": prediction,
     }
     if azure_info:
         result["azure"] = azure_info
+    if db_insert_status is not None:
+        result["postgres_insert"] = db_insert_status
     return result
 
 @app.get("/sensor_data")

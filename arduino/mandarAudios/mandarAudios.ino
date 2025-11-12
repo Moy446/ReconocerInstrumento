@@ -20,8 +20,8 @@
 /*Casa
 INFINITUMFB33
 HdKHhdnK7C*/
-const char* ssid = "INFINITUMFB33";
-const char* password = "HdKHhdnK7C";
+const char* ssid = "Holiwis";
+const char* password = "1234567890";
 const char* serverUrl = "https://detectarinstrumentos.azurewebsites.net/upload_chunk";
 const char* serverFinalizar = "https://detectarinstrumentos.azurewebsites.net/finalize_wav";
 DHT dht(DHTPIN, DHTTYPE);
