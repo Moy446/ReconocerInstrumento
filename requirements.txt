@@ -10,3 +10,4 @@ python-multipart
 pydantic
 azure-storage-blob>=12.20.0
 python-dotenv
+scipy

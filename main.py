@@ -6,6 +6,10 @@ import json
 from datetime import datetime
 from typing import Optional
 import sys
+import numpy as np
+import scipy.signal as sps
+from collections import defaultdict
+import time
 
 # Cargar variables .env en desarrollo local si existe (no afecta Azure App Service que ya inyecta vars)
 try:
@@ -34,9 +38,11 @@ app = FastAPI()
 audio_file = "grabacion.raw"
 wav_file = "grabacion.wav"
 sensor_data_file = "mediciones.json"
-sampleRate = 16000
+sampleRate = 32000
 numChannels = 1
 sampleWidth = 2
+wf = None
+recording_started = False
 
 # Almacenar datos de sensores
 sensor_readings = []
@@ -139,42 +145,61 @@ def db_connect():
 
 @app.post("/upload_chunk")
 async def upload_chunk(request: Request):
-    global sensor_readings  # Declarar como global
-    
-    data = await request.body()  # Esto recibe los bytes tal cual
-    
-    # Obtener datos del sensor de los headers
+    global sensor_readings, recording_started, wf
+
+    if not recording_started:
+        recording_started = True
+        sensor_readings = []
+
+        wf = wave.open(audio_file, "wb")
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sampleRate)
+
+    # Recibir los bytes crudos del audio
+    data = await request.body()
+
+    # Obtener datos de sensores
     humidity = request.headers.get("X-Humidity", "0")
     timestamp = request.headers.get("X-Timestamp", str(int(datetime.now().timestamp() * 1000)))
-    
-    # Guardar datos del sensor
+
+    # Guardar lectura del sensor
     sensor_reading = {
-        "timestamp": int(timestamp),  # Convertir a int
+        "timestamp": int(timestamp),
         "humidity": float(humidity),
         "chunk_size": len(data),
         "datetime": datetime.now().isoformat()
     }
     sensor_readings.append(sensor_reading)
-    
-    # Guardar audio
-    with open(audio_file, "ab") as f:
-        f.write(data)
-    
-    # Guardar datos de sensores en archivo JSON
+
+    # Guardar datos de sensores en JSON
     with open(sensor_data_file, "w") as f:
         json.dump(sensor_readings, f, indent=2)
-    
+
+    # --- Guardar audio en formato WAV correctamente ---
+    if len(data) > 0:
+        wf.writeframes(data)
+
     return {
-        "status": "ok", 
+        "status": "ok",
         "chunk_size": len(data),
         "humidity": humidity,
         "total_readings": len(sensor_readings)
     }
 
+
 @app.get("/finalize_wav")
 def finalize_wav():
-    global sensor_readings  # Declarar como global al inicio
-    
+    global sensor_readings, wf, recording_started
+
+    # Cerrar escritura activa
+    if wf:
+        wf.close()
+        wf = None
+
+    recording_started = False
+
+    # Validar archivo recibido
     if not os.path.exists(audio_file):
         return {"status": "error", "message": "No hay datos para procesar."}
 
@@ -182,16 +207,55 @@ def finalize_wav():
     if filesize == 0:
         return {"status": "error", "message": "Archivo vacío."}
 
+    # --- Crear WAV base (sin filtrar) ---
     with open(audio_file, "rb") as rf:
         raw_data = rf.read()
 
-    with wave.open(wav_file, 'wb') as wf:
-        wf.setnchannels(numChannels)
-        wf.setsampwidth(sampleWidth)
-        wf.setframerate(sampleRate)
-        wf.writeframes(raw_data)
+    with wave.open(wav_file, "wb") as wf_tmp:
+        wf_tmp.setnchannels(numChannels)
+        wf_tmp.setsampwidth(sampleWidth)
+        wf_tmp.setframerate(sampleRate)
+        wf_tmp.writeframes(raw_data)
 
-    # Procesar estadísticas de los datos del sensor
+    # --- Aplicar filtro band-pass como el código que pediste ---
+    try:
+        cleaned_wav = "grabacion_limpia.wav"
+
+        # Leer señal
+        with wave.open(wav_file, "rb") as rf:
+            frames = rf.readframes(rf.getnframes())
+            sr = rf.getframerate()
+
+        audio = np.frombuffer(frames, dtype=np.int16).astype(np.float32)
+
+        # Calcular frecuencias normalizadas
+        low = 300 / (sr / 2)
+        high = 3400 / (sr / 2)
+
+        # Protección por si audio es muy corto
+        if len(audio) < 50:
+            raise Exception("Audio demasiado corto para filtrar")
+
+        b, a = sps.butter(4, [low, high], btype="band")
+        filtered = sps.lfilter(b, a, audio)
+
+        # Guardar WAV filtrado
+        with wave.open(cleaned_wav, "wb") as wf_out:
+            wf_out.setnchannels(1)
+            wf_out.setsampwidth(2)
+            wf_out.setframerate(sampleRate)
+            wf_out.writeframes(filtered.astype(np.int16).tobytes())
+
+        wav_to_use = cleaned_wav
+        print("✔ Audio filtrado correctamente (300–3400 Hz).")
+
+    except Exception as e:
+        print(f"⚠ No se pudo filtrar audio: {e}")
+        wav_to_use = wav_file
+
+    # -----------------------------
+    #   ESTADÍSTICAS DE SENSORES
+    # -----------------------------
     sensor_stats = {}
     if sensor_readings:
         humidities = [reading["humidity"] for reading in sensor_readings]
@@ -200,104 +264,87 @@ def finalize_wav():
             "humidity_avg": sum(humidities) / len(humidities),
             "humidity_min": min(humidities),
             "humidity_max": max(humidities),
-            "recording_duration_ms": sensor_readings[-1]["timestamp"] - sensor_readings[0]["timestamp"] if len(sensor_readings) > 1 else 0
+            "recording_duration_ms":
+                sensor_readings[-1]["timestamp"] - sensor_readings[0]["timestamp"]
+                if len(sensor_readings) > 1 else 0
         }
 
-    # Subir a Azure Blob si está configurado
-    azure_info = {}
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    if container_client is not None:
-        try:
-            wav_blob_name = f"recordings/grabacion_{timestamp}.wav"
-            meta_blob_name = f"recordings/mediciones_{timestamp}.json"
-
-            # Subir WAV
-            with open(wav_file, "rb") as f:
-                container_client.upload_blob(
-                    name=wav_blob_name,
-                    data=f,
-                    overwrite=True,
-                    content_settings=ContentSettings(content_type="audio/wav")
-                )
-            # Subir JSON de sensores (si existe)
-            if os.path.exists(sensor_data_file):
-                with open(sensor_data_file, "rb") as f:
-                    container_client.upload_blob(
-                        name=meta_blob_name,
-                        data=f,
-                        overwrite=True,
-                        content_settings=ContentSettings(content_type="application/json")
-                    )
-
-            azure_info = {
-                "container": container_name,
-                "wav_blob": wav_blob_name,
-                "wav_url": f"{container_client.url}/{wav_blob_name}",
-                "sensor_blob": meta_blob_name,
-                "sensor_url": f"{container_client.url}/{meta_blob_name}"
-            }
-        except Exception as e:
-            azure_info = {"error": str(e)}
-
-    # Predicción (si hay modelo)
+    # -----------------------------
+    #   PREDICCIÓN MODELO
+    # -----------------------------
     prediction = {"instrument": "Unknown", "note": "Unknown"}
     if predictor is not None:
         try:
-            prediction = predictor.predict(wav_file)
+            prediction = predictor.predict(wav_to_use)
         except Exception as e:
             prediction = {"instrument": "Unknown", "note": "Unknown", "error": str(e)}
-
-    # Insertar en PostgreSQL (si está configurado)
-    db_insert_status = None
-    if DB_AVAILABLE:
-        conn = db_connect()
-        if conn is not None:
-            try:
-                wav_url = None
-                if isinstance(azure_info, dict) and azure_info.get("wav_url"):
-                    wav_url = azure_info["wav_url"]
-                hum_avg = None
-                if isinstance(sensor_stats, dict) and "humidity_avg" in sensor_stats:
-                    hum_avg = float(sensor_stats["humidity_avg"]) if sensor_stats["humidity_avg"] is not None else None
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "INSERT INTO public.detections (instrument, note, humidity_avg) VALUES (%s, %s, %s);",
-                        (
-                            prediction.get("instrument"),
-                            prediction.get("note"),
-                            hum_avg,
-                        ),
+    # -----------------------------
+    #   SUBIR A AZURE BLOB STORAGE
+    # -----------------------------
+    if container_client:
+        try:
+            blob_name = f"audio_{int(time.time())}.wav"
+            with open(wav_to_use, "rb") as data:
+                container_client.upload_blob(name=blob_name, data=data, overwrite=True)
+            print(f"✔ WAV subido a Azure Blob: {blob_name}")
+        except Exception as e:
+            print(f"⚠ Error al subir WAV a Azure Blob: {e}")
+    # -----------------------------
+    #   INSERTAR EN POSTGRESQL
+    # -----------------------------
+    conn = db_connect()
+    if conn:
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO public.detections (instrument, note, humidity) VALUES (%s, %s, %s)",
+                    (
+                        prediction.get("instrument", "Unknown"),
+                        prediction.get("note", "Unknown"),
+                        sensor_stats.get("humidity_avg", None),
                     )
-                    conn.commit()
-                db_insert_status = "inserted"
-            except Exception as e:
-                db_insert_status = f"error: {e}"
+                )
+                conn.commit()
+            print("✔ Registro insertado en PostgreSQL.")
+        except Exception as e:
+            print(f"⚠ Error al insertar en PostgreSQL: {e}")
 
-    # Limpiar datos para próxima grabación
+    # Reset
     sensor_readings = []
 
-    result = {
-        "status": "ok", 
+    return {
+        "status": "ok",
         "audio_file": wav_file,
+        "clean_audio": wav_to_use,
         "audio_size": filesize,
-        "sensor_data_file": sensor_data_file,
         "sensor_stats": sensor_stats,
         "prediction": prediction,
     }
-    if azure_info:
-        result["azure"] = azure_info
-    if db_insert_status is not None:
-        result["postgres_insert"] = db_insert_status
-    return result
+
 
 @app.get("/sensor_data")
 def get_sensor_data():
     """Endpoint para obtener los datos del sensor por separado"""
-    if os.path.exists(sensor_data_file):
-        with open(sensor_data_file, "r") as f:
-            data = json.load(f)
-        return {"status": "ok", "data": data}
-    return {"status": "error", "message": "No hay datos de sensores disponibles"}
+    conn = db_connect()
+    ins = set(["bateria","guitarra","violin","piano"])
+    dataInst = defaultdict(int)
+    dataNote = defaultdict(int)
+    dataHumidity = defaultdict(int)
+    if conn:
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT instrument,note,humidity,count(*) AS total FROM public.detections GROUP BY instrument,note,humidity;"
+                )
+                data = cur.fetchall()
+            for instrument,note,humidity,total in data:
+                dataInst[instrument] += total
+                dataNote[note] += total
+                dataHumidity[humidity] += total
+
+            return {"status":"ok", "data":{"instrumentos": dict(dataInst),"notas": dict(dataNote),"humedades": dict(dataHumidity)}}
+        except Exception as e:
+            return {"status": "error", "message": f"Error al seleccionar datos en PostgreSQL: {e}"}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
