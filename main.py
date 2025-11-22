@@ -330,6 +330,9 @@ def get_sensor_data():
     dataInst = defaultdict(int)
     dataNote = defaultdict(int)
     dataHumidity = defaultdict(int)
+    lastInstrument = ""
+    lastNote = ""
+    lastHumidity = ""
     if conn:
         try:
             with conn.cursor() as cur:
@@ -337,12 +340,17 @@ def get_sensor_data():
                     "SELECT instrument,note,humidity,count(*) AS total FROM public.detections GROUP BY instrument,note,humidity;"
                 )
                 data = cur.fetchall()
+                cur.execute(
+                    "SELECT instrument,note,humidity FROM public.detections ORDER BY id DESC limit 1;"
+                )
+                lastData = cur.fetchall()
             for instrument,note,humidity,total in data:
                 dataInst[instrument] += total
                 dataNote[note] += total
                 dataHumidity[humidity] += total
-
-            return {"status":"ok", "data":{"instrumentos": dict(dataInst),"notas": dict(dataNote),"humedades": dict(dataHumidity)}}
+            lastInstrument,lastNote,lastHumidity = lastData[0]
+            
+            return {"status":"ok", "data":{"instrumentos": dict(dataInst),"notas": dict(dataNote),"humedades": dict(dataHumidity), "lastInstrument": lastInstrument, "lastNote": lastNote, "lastHumidity": lastHumidity}}
         except Exception as e:
             return {"status": "error", "message": f"Error al seleccionar datos en PostgreSQL: {e}"}
 
