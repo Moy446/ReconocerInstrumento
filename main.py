@@ -151,12 +151,7 @@ async def upload_chunk(request: Request):
         recording_started = True
         sensor_readings = []
 
-        wf = wave.open(audio_file, "wb")
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(sampleRate)
-
-    # Recibir los bytes crudos del audio
+    data = await request.body()
     data = await request.body()
 
     # Obtener datos de sensores
@@ -176,9 +171,9 @@ async def upload_chunk(request: Request):
     with open(sensor_data_file, "w") as f:
         json.dump(sensor_readings, f, indent=2)
 
-    # --- Guardar audio en formato WAV correctamente ---
     if len(data) > 0:
-        wf.writeframes(data)
+        with open(audio_file, "ab") as f:
+            f.write(data)
 
     return {
         "status": "ok",
@@ -190,12 +185,7 @@ async def upload_chunk(request: Request):
 
 @app.get("/finalize_wav")
 def finalize_wav():
-    global sensor_readings, wf, recording_started
-
-    # Cerrar escritura activa
-    if wf:
-        wf.close()
-        wf = None
+    global sensor_readings, recording_started
 
     recording_started = False
 
@@ -207,7 +197,7 @@ def finalize_wav():
     if filesize == 0:
         return {"status": "error", "message": "Archivo vacío."}
 
-    # --- Crear WAV base (sin filtrar) ---
+    # Crear WAV base a partir del RAW recibido
     with open(audio_file, "rb") as rf:
         raw_data = rf.read()
 
@@ -217,6 +207,8 @@ def finalize_wav():
         wf_tmp.setframerate(sampleRate)
         wf_tmp.writeframes(raw_data)
 
+    wav_to_use = wav_file
+    
     # --- Aplicar filtro band-pass como el código que pediste ---
     try:
         cleaned_wav = "grabacion_limpia.wav"
